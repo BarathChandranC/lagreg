@@ -416,8 +416,11 @@ def main(args):
         vocab_size, sequences, seq_len, _, _, _ = load_data(params["data_path"], device)
         train_seqs = sequences[li:ri]
 
-        # For the test set we take the following N_test (after the rightmost training set index bound)
-        test_seqs = sequences[ri : ri + args.N_test]
+        test_start = ri if args.test_block_i is None else args.test_block_i * reduced_length
+        test_end = test_start + args.N_test
+        if test_end > len(sequences):
+            raise ValueError(f"Test block [{test_start}:{test_end}] exceeds dataset size {len(sequences)}")
+        test_seqs = sequences[test_start:test_end]
 
         # Convert train and test data to one-hot vectors
         train_embeddings = torch.nn.functional.one_hot(train_seqs.long(), num_classes=vocab_size).float().to(device)
@@ -549,7 +552,7 @@ def main(args):
                 # Otherwise, recompute and save to cache for future use
                 logger.info("Epoch %d", epoch)
                 ckpt = model_dir / f"test_model_script_epoch_{epoch}.pt"
-                if not ckpt.exists() or not load_checkpoint(model, str(ckpt), device, training=False):
+                if not ckpt.exists() or not load_checkpoint(model, str(ckpt), device=device, training=False):
                     logger.warning("Checkpoint %d failed", epoch)
                     continue
                 model.eval()
@@ -770,6 +773,8 @@ if __name__ == "__main__":
         help="Comma-separated list of model generation directories",
     )
     p.add_argument("--N-test", type=int, default=50000)
+    p.add_argument("--test-block-i", type=int, default=None,
+                   help="Use this fixed reduced-length block for test data (default: block after training).")
     p.add_argument("--which-epoch", type=int, default=None,
                    help="Evaluate a single epoch. Omit to scan all available "
                         "checkpoints (needed to locate the NN-divergence "

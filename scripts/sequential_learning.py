@@ -246,7 +246,7 @@ def load_epoch_weights_once(unique_paths, exp_cache, epoch: int, device):
         exp = exp_cache[p]
         ckpt = p / f"test_model_script_epoch_{epoch}.pt"
         if (not ckpt.exists()) or (
-            not load_checkpoint(exp["model"], str(ckpt), device, training=False)
+            not load_checkpoint(exp["model"], str(ckpt), device=device, training=False)
         ):
             raise RuntimeError(f"Checkpoint load failed: {ckpt}")
         exp["model"].eval()

@@ -13,7 +13,6 @@ setup(
         'numba',
         'matplotlib',
         'seaborn',
-        'wandb',
         'tqdm',
     ],
     author='Luca Biggio, Davide Beltrame',

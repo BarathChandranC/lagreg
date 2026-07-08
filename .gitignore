@@ -19,4 +19,5 @@ cli.sh
 
 jobs/
 notebooks/**
-**/tests
+
+Figs/

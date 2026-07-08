@@ -2,7 +2,6 @@ import os
 import json
 from tqdm import trange
 import torch
-import wandb
 from .losses import compute_mse_loss, compute_cross_entropy_loss, get_loss_coefficients_continuous_new
 from .diffusion import generate_noisy_sequences_single
 
@@ -135,7 +134,6 @@ def train_model(
     use_compute_mse_loss=False,
     use_cross_entropy_loss=True,
     scheduler=None,
-    use_wandb=False,
     checkpointing_period_epochs=None,
     model_dir=None,
     checkpoint_id=None,
@@ -157,7 +155,6 @@ def train_model(
         use_compute_mse_loss (bool): Whether to use the MSE loss.
         use_cross_entropy_loss (bool): Whether to use the cross-entropy loss.
         scheduler (torch.optim.lr_scheduler._LRScheduler, optional): Learning rate scheduler.
-        use_wandb (bool): Whether to use Weights & Biases logging.
         checkpointing_period_epochs (int, optional): Number of checkpoints to save.
         model_dir (str, optional): Directory in which to save the model.
         checkpoint_id (str, optional): Identifier for the checkpoint file names.
@@ -281,11 +278,6 @@ def train_model(
             training_history['learning_rate'].append(
                 optimizer.state_dict()['param_groups'][0]['lr']
             )
-
-            # Log metrics to Weights & Biases if enabled
-            if use_wandb:
-                wandb.log({'learning_rate': optimizer.state_dict()['param_groups'][0]['lr']}, step=epoch_counter)
-                wandb.log({'training_loss': epoch_loss}, step=epoch_counter)
 
             pbar.set_postfix(
                 training_loss=training_history['training_loss'][-1],

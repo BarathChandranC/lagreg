@@ -273,7 +273,7 @@ def main(args):
 
             logger.info("Epoch %d", epoch)
             ckpt = model_dir / f"test_model_script_epoch_{epoch}.pt"
-            if (not ckpt.exists()) or (not load_checkpoint(model, str(ckpt), device, training=False)):
+            if (not ckpt.exists()) or (not load_checkpoint(model, str(ckpt), device=device, training=False)):
                 logger.warning("Checkpoint %d failed", epoch)
                 continue
             model.eval()

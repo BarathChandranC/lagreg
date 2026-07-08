@@ -16,9 +16,6 @@ from modules.noise_schedules import alpha_bars_schedule, get_alpha_beta_from_alp
 from modules.training import train_model
 from utils import load_data, create_model, setup_device, create_save_path, load_checkpoint, load_params
 
-# Set environment variable for wandb service wait time
-os.environ["WANDB__SERVICE_WAIT"] = "300"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -41,13 +38,6 @@ def main(args):
     # Set device
     device = setup_device()
     torch.set_float32_matmul_precision('high')
-
-    # Initialize wandb if enabled
-    if args.use_wandb:
-        import wandb
-        wandb.init(project=args.wandb_project, entity=args.wandb_entity)
-        wandb.config.update(vars(args))
-        logger.info("Wandb initialized with project: %s, entity: %s", args.wandb_project, args.wandb_entity)
 
     # Load data
     vocab_size, sequences, seq_len, _, _, _ = load_data(args.data_path, device)
@@ -206,7 +196,6 @@ def main(args):
         model_dir=save_path,
         checkpoint_id='test_model_script',
         save_final_model=args.save_final_model,
-        use_wandb=args.use_wandb,
         epoch_start=epoch_start,
         count_fun=counter_start,
         reweighting=args.reweighting,
@@ -219,9 +208,6 @@ if __name__ == '__main__':
 
     # Experiment parameters.
     parser.add_argument('--seed', type=int, default=0, help='Random seed.')
-    parser.add_argument('--use-wandb', action='store_true', help='Enable wandb logging.')
-    parser.add_argument('--wandb-project', type=str, help='Wandb project name.')
-    parser.add_argument('--wandb-entity', type=str, help='Wandb entity name.')
     parser.add_argument('--resume-checkpoint-path', type=str, default=None, help='Path to resume training from a checkpoint.')
     parser.add_argument('--reweighting', action='store_true', help='Enable reweighting.')
     parser.add_argument('--model-name', type=str, default='transformer', help='Model name for saving directory.')

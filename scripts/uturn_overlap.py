@@ -177,7 +177,11 @@ def main(args):
         ri = li + reduced_length
         train_seqs = sequences[li:ri]
 
-        test_seqs = sequences[ri:ri+args.N_test]
+        test_start = ri if args.test_block_i is None else args.test_block_i * reduced_length
+        test_end = test_start + args.N_test
+        if test_end > len(sequences):
+            raise ValueError(f"Test block [{test_start}:{test_end}] exceeds dataset size {len(sequences)}")
+        test_seqs = sequences[test_start:test_end]
 
         # One-hot mapping
         train_seqs_one_hot = torch.nn.functional.one_hot(
@@ -259,7 +263,7 @@ def main(args):
             logger.info("Epoch %d", epoch)
             # Load checkpoint
             ckpt = model_dir / f"test_model_script_epoch_{epoch}.pt"
-            if (not ckpt.exists()) or (not load_checkpoint(model, str(ckpt), device, training=False)):
+            if (not ckpt.exists()) or (not load_checkpoint(model, str(ckpt), device=device, training=False)):
                 logger.warning("Checkpoint %d failed", epoch)
                 continue
             model.eval()
@@ -549,6 +553,8 @@ if __name__ == '__main__':
                    default="results_transformer_pick_0_for_training/models_restricted_continuous_0/test_model_script_20000_5000_cross_entropy_loss/8_512",
                    help='Comma-separated list of model generation directories')
     p.add_argument("--N-test", type=int, default=1000)
+    p.add_argument("--test-block-i", type=int, default=None,
+                   help="Use this fixed reduced-length block for test data (default: block after training).")
     p.add_argument("--which-epoch", type=int, default=None,
                    help="Single epoch to evaluate. Paper Fig. 5 compares two "
                         "checkpoints: the NN-divergence minimum and the "
