@@ -1,6 +1,6 @@
 # Biased Generalization in Diffusion Models
 
-Code for the numerical experiments in the paper [Biased Generalization in Diffusion Models](https://arxiv.org/abs/2603.03469) by J. Garnier-Brun, L. Biggio, D. Beltrame, M. Mézard, and L. Saglietti. Accepted as a Spotlight at ICML 2026.
+Code for the numerical experiments in the paper [Biased Generalization in Diffusion Models](https://openreview.net/forum?id=IqTvyp40O6) by J. Garnier-Brun, L. Biggio, D. Beltrame, M. Mézard, and L. Saglietti. Accepted as a Spotlight at ICML 2026.
 
 Hierarchical-data (controlled setting) experiments live in `scripts/` (experiment files) and `modules/` (core logic).
 
