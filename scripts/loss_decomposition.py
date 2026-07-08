@@ -910,6 +910,7 @@ def run_loss_decomposition(
     seed: int = 42,
     device: Optional[torch.device] = None,
     fixed_timestep_ratio: float = 0.1,
+    test_block_i: Optional[int] = None,
 ) -> LossDecompositionResults:
     """
     Run loss decomposition analysis on a trained model.
@@ -951,14 +952,17 @@ def run_loss_decomposition(
     # Use pick_i_for_training if present (priority over pick_last_for_training)
     pick_i = params.get('pick_i_for_training', None)
     if pick_i is not None:
-        # Block indexing: train = [pick_i*N : (pick_i+1)*N], test = [(pick_i+1)*N : (pick_i+2)*N]
+        # Block indexing: train is selected by pick_i; test is either explicit
+        # or the historical following block.
         li = pick_i * N_train
         ri = li + N_train
         total = len(sequences)
-        if ri + N_train <= total:
+        test_start = ri if test_block_i is None else test_block_i * N_train
+        test_end = test_start + N_train
+        if ri <= total and test_end <= total:
             data_train = sequences[li:ri]
-            data_test = sequences[ri:ri + N_train]
-            logger.info(f"Data Split: Training block {pick_i} [{li}:{ri}], Test block [{ri}:{ri+N_train}]")
+            data_test = sequences[test_start:test_end]
+            logger.info(f"Data Split: Training block {pick_i} [{li}:{ri}], Test block [{test_start}:{test_end}]")
         else:
             # Fallback to pick_i=0 with warning
             logger.warning(f"pick_i={pick_i} out of bounds (total={total}), falling back to pick_i=0")
@@ -1096,6 +1100,7 @@ def run_multiseed(
     random_seed: int,
     fixed_timestep_ratio: float,
     device: torch.device,
+    test_block_i: Optional[int],
 ) -> Dict[int, LossDecompositionResults]:
     """
     Run loss decomposition across multiple model seeds.
@@ -1136,6 +1141,7 @@ def run_multiseed(
                 seed=random_seed,
                 device=device,
                 fixed_timestep_ratio=fixed_timestep_ratio,
+                test_block_i=test_block_i,
             )
             all_results[model_seed] = results
         except Exception as e:
@@ -1232,6 +1238,7 @@ def main(args: Namespace) -> None:
             random_seed=args.seed,
             fixed_timestep_ratio=args.fixed_t_ratio,
             device=device,
+            test_block_i=args.test_block_i,
         )
         
         if len(all_results) == 0:
@@ -1346,6 +1353,7 @@ def main(args: Namespace) -> None:
         seed=args.seed,
         device=device,
         fixed_timestep_ratio=args.fixed_t_ratio,
+        test_block_i=args.test_block_i,
     )
     
     if len(results.epochs) == 0:
@@ -1485,6 +1493,10 @@ if __name__ == '__main__':
     parser.add_argument(
         '--sample-size', type=int, default=None,
         help='Number of samples to use (default: full dataset)'
+    )
+    parser.add_argument(
+        '--test-block-i', type=int, default=None,
+        help='Use this fixed reduced-length block for test data (default: block after training)'
     )
     parser.add_argument(
         '--seed', type=int, default=42,

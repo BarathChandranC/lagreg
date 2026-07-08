@@ -12,8 +12,8 @@ dependencies:
   - python=3.10
 
   # PyTorch (CPU only)
-  - pytorch::pytorch>=2.1
-  - pytorch::torchvision>=0.16
+  - pytorch::pytorch=2.5.1
+  - pytorch::torchvision=0.20.1
   - pytorch::cpuonly
 
   # scientific computing
@@ -33,9 +33,11 @@ dependencies:
 
   # dev / testing
   - pytest>=7.0
+  - setuptools>=69
 
   # pip-only packages
   - pip
   - pip:
-    - wandb
     - seaborn
+    - PyWavelets
+    - pytorch-fid==0.3.0

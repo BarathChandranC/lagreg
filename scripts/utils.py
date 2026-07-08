@@ -160,8 +160,23 @@ def get_checkpoint_files(checkpoint_dir):
     """
     Return a sorted list of checkpoint files in the given directory.
     """
-    files = [f for f in os.listdir(checkpoint_dir) if 'test_model_script' in f]
-    return sorted(files, key=lambda x: os.path.getctime(os.path.join(checkpoint_dir, x)))
+    files = [f for f in os.listdir(checkpoint_dir) if f.startswith('test_model_script') and f.endswith('.pt')]
+
+    def epoch_from_name(name: str):
+        stem = os.path.splitext(name)[0]
+        try:
+            return int(stem.rsplit('_', 1)[-1])
+        except ValueError:
+            return None
+
+    files_with_epoch = [(f, epoch_from_name(f)) for f in files]
+    files_with_epoch.sort(
+        key=lambda item: (
+            item[1] is None,
+            item[1] if item[1] is not None else os.path.getctime(os.path.join(checkpoint_dir, item[0])),
+        )
+    )
+    return [f for f, _ in files_with_epoch]
 
 
 def create_save_path(data_path, n_iter, reduced_length, loss_name, num_layers, hidden_size, discrete_diffusion, rescaled, seed=None, model_type="transformer", add_flag=None, results_dir=None):

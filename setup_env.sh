@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-ENV_NAME="gpu_env_dl"
+ENV_NAME="${CONDA_ENV_NAME:-gpu_env_dl}"
 
 # ── parse args ────────────────────────────────────────────────────────────────
 MODE=""
@@ -50,14 +50,12 @@ fi
 eval "$(conda shell.bash hook)"
 echo "conda $(conda --version) — creating $ENV_NAME ($MODE) from $ENV_FILE"
 
-# ── remove stale env if present ───────────────────────────────────────────────
+# ── create or update the requested env ───────────────────────────────────────
 if conda env list | grep -qw "$ENV_NAME"; then
-    echo "Removing existing $ENV_NAME environment..."
-    conda env remove -n "$ENV_NAME" -y
+    conda env update -n "$ENV_NAME" -f "$ENV_FILE" --prune
+else
+    conda env create -n "$ENV_NAME" -f "$ENV_FILE"
 fi
-
-# ── create env ────────────────────────────────────────────────────────────────
-conda env create -f "$ENV_FILE"
 
 # ── install biased-generalization in editable mode ─────────────────────────────────────────
 conda activate "$ENV_NAME"
@@ -67,7 +65,7 @@ pip install -e "$SCRIPT_DIR" --no-deps
 echo ""
 echo "-- sanity check --"
 python -c "
-import torch, torchvision, numpy, scipy, numba, matplotlib, tqdm, natsort
+import torch, torchvision, numpy, scipy, numba, matplotlib, tqdm, natsort, pywt
 print(f'torch      {torch.__version__}  (CUDA: {torch.cuda.is_available()})')
 print(f'torchvision {torchvision.__version__}')
 print(f'numpy      {numpy.__version__}')

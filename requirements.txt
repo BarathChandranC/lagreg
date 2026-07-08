@@ -1,6 +1,6 @@
 # PyTorch is recommended to be installed first or with specific CUDA flags depending on the HPC
-torch
-torchvision
+torch==2.5.1
+torchvision==0.20.1
 
 # Scientific Computing
 numpy
@@ -12,5 +12,9 @@ matplotlib
 seaborn
 
 # Utilities
-wandb
 tqdm
+natsort
+pillow
+PyWavelets
+pytorch-fid==0.3.0
+setuptools>=69

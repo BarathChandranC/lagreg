@@ -4,7 +4,7 @@ gen_filtered_hierarchical_data.py
 This script contains functions for generating data following the procedure described in our paper "How transformers learn structured data: insights from hierarchical filtering."
 It leverages numpy for numerical operations and multiprocessing for parallel generation of a large number of samples (N_trials).
 The data is saved in a numpy file with the following format:
-[q,l,sigma,x0s,xis,M,k] where:
+[q,l,sigma,x0s,xis,M,restrictions] where:
 - q: Size of the vocabulary
 - q_eff: number of non-zero transitions for each parent
 - l: Depth of the tree
@@ -12,14 +12,13 @@ The data is saved in a numpy file with the following format:
 - x0s: Array of root nodes of dim (N_trials)
 - xis: Array of leaf nodes of dim (2**l,N_trials)
 - M: Transition rates matrix of dim (q,q,q)
-- k: Number of factorized layers
+- restrictions: forbidden child-symbol pairs
 
 Functions:
 - get_P_xlevel_root(M, level): Computes the probability matrices for a given level (i.e. Eq. (3) of our paper).
 - get_leaves(x0, M, l, k, probs): Generates leaves from a root x0.
 - get_M(q, sigma): Generates the transition rates matrix M.
-- build_args(N_trials, M, l, q, k, probs): Builds the arguments for the parallel generation of samples.
-- gen_tree(M, l, q, k, probs): Generates a couple root,leaves.
+- gen_tree(sample_index, M, l, q, k, probs, seed): Generates one root/leaves pair from an index-derived RNG stream.
 
 Dependencies:
 - numpy
@@ -28,8 +27,12 @@ Dependencies:
 - multiprocessing.cpu_count
 """
 
+import argparse
+from functools import partial
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+
 import numpy as np
-from multiprocessing import Pool,cpu_count
 from scipy.special import softmax
 
 
@@ -53,19 +56,20 @@ def get_P_xlevel_root(M,level):
     return probs 
 
 
-def get_leaves(x0,M,l,level,probs):
+def get_leaves(x0, M, l, level, probs, rng=None):
+    rng = np.random if rng is None else rng
 
     def get_branches(S,M):
         # Get the two branches from a given state S using the standard rule
         p_flat = M[S,:,:].ravel()
         ind = np.arange(len(p_flat))
-        return np.unravel_index(np.random.choice(ind, p=p_flat),M[S,:,:].shape)
+        return np.unravel_index(rng.choice(ind, p=p_flat),M[S,:,:].shape)
     
     def get_nodes(x0,probs,level):
         nodes = np.empty(2**level,dtype=np.int8)
         q = probs.shape[0]
         for i in range(2**level):
-            nodes[i] = np.random.choice(np.arange(q),p=probs[x0,:,i])
+            nodes[i] = rng.choice(np.arange(q),p=probs[x0,:,i])
         return nodes
     
     x = get_nodes(x0,probs,level).astype(np.int8)
@@ -110,18 +114,19 @@ def get_M(q,sigma):
     return M,[tuples[i] for i in forbidden_tuples_idx] """
 
 
-def get_M_wforbidden(q,sigma,q_eff):
+def get_M_wforbidden(q, sigma, q_eff, rng=None):
+    rng = np.random if rng is None else rng
 
     h = np.full((q,q,q), -np.inf) # Actually parametrize with logits
     M = np.empty((q,q,q))
     tuples = np.array([(i,j) for i in range(q) for j in range(q)]) # Generate the non-overlaping partitions that do NOT include all transitions
-    np.random.shuffle(tuples)
+    rng.shuffle(tuples)
     forbidden_tuples = np.empty((q,q-q_eff,2))
 
     for i in range(q):
         for j in range(i*q,i*q + q_eff):
             k,l = tuples[j]
-            h[i,k,l] = sigma*np.random.randn()
+            h[i,k,l] = sigma*rng.randn()
         for j in range(i*q + q_eff,i*q + q):
             forbidden_tuples[i,(j-q_eff)%q,:] = tuples[j][:]
         M[i,:,:] = softmax(h[i,:,:])
@@ -131,49 +136,75 @@ def get_M_wforbidden(q,sigma,q_eff):
     return M,forbidden_tuples
 
 
-def build_args(N_trials,M,l,q,k,probs):
-    arg_tuples = [(M,l,q,k,probs) for i in range(N_trials)]
-    return arg_tuples
-
-
-def gen_tree(M,l,q,k,probs):
-    np.random.seed()
-    x0 = np.random.randint(q) # Generate the root
-    leaves = get_leaves(x0,M,l,k,probs)
+def gen_tree(sample_index, M, l, q, k, probs, seed):
+    """Generate one sample from a seed derived only from its dataset index."""
+    rng = np.random.default_rng(np.random.SeedSequence([seed, sample_index]))
+    x0 = rng.integers(q)
+    leaves = get_leaves(x0, M, l, k, probs, rng=rng)
     return x0,leaves
 
 
-def generate_dataset(q, l, sigma, q_eff, seed, N_trials=int(1e6), k=0):
-    p = Pool(cpu_count()) # Fix desired number of cpu threads for the generative process
-    # Generate the data
-    np.random.seed(seed)
-    M,restrictions = get_M_wforbidden(q,sigma,q_eff)
+def generate_dataset(q, l, sigma, q_eff, seed, N_trials=int(1e6), k=0, workers=None):
+    if N_trials <= 0:
+        raise ValueError("N_trials must be positive")
+    workers = cpu_count() if workers is None else int(workers)
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+
+    # Preserve the historical seed-0 grammar while giving every sample an
+    # index-derived RNG stream that is independent of worker scheduling.
+    grammar_rng = np.random.RandomState(seed)
+    M,restrictions = get_M_wforbidden(q, sigma, q_eff, rng=grammar_rng)
     probs = get_P_xlevel_root(M,k)
-    runs = p.starmap(gen_tree,build_args(N_trials,M,l,q,k,probs)) # Will generate the data in parallel over p processes
-    p.close()
 
     x0s = np.empty(N_trials)
     xis = np.empty((int(2**l),N_trials),dtype=np.int8) # Save as integers to save memory
-    for h in range(N_trials):
-        x0s[h],xis[:,h] = runs[h]
+    worker = partial(gen_tree, M=M, l=l, q=q, k=k, probs=probs, seed=seed)
+    if workers == 1:
+        runs = map(worker, range(N_trials))
+        for h, (root, leaves) in enumerate(runs):
+            x0s[h], xis[:, h] = root, leaves
+    else:
+        chunksize = max(1, N_trials // (workers * 16))
+        with Pool(workers) as pool:
+            for h, (root, leaves) in enumerate(pool.imap(worker, range(N_trials), chunksize=chunksize)):
+                x0s[h], xis[:, h] = root, leaves
     
     return np.array([q,l,sigma,x0s,xis,M,restrictions],dtype=object)
 
 
 if __name__ == "__main__":
-    # Set the parameters for the generative process
-    # These default parameters correspond to the paper setting (e.g. seed 0 for reproducibility).
-    N_trials = int(1e6) # Number of samples to generate
-    l = 4 # Depth of the tree
-    q = 6 # Size of vocabulary
-    sigma = 1.0 # Standard deviation of the noise generating the grammar
-    seed = 0 # Seed for reproducibility 
-    k = 0 # Number of factorized layer, always take zero here
-    q_eff = 4 # Number of allowed transitions out of q^2 possible
-    
-    data = generate_dataset(q, l, sigma, q_eff, seed, N_trials, k)
-    
-    # Save the data in a convenient format
-    import os
-    os.makedirs('./data', exist_ok=True)
-    np.save('./data/labeled_data_restrictedfixed_{}_{}_{}_{}_{}.npy'.format(q,l,sigma,q_eff,seed), data)
+    parser = argparse.ArgumentParser(description="Generate the controlled hierarchical dataset deterministically.")
+    parser.add_argument("--n-trials", type=int, default=int(1e6))
+    parser.add_argument("--workers", type=int, default=cpu_count())
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--q", type=int, default=6)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--factorized-layers", type=int, default=0)
+    parser.add_argument("--q-eff", type=int, default=4)
+    args = parser.parse_args()
+
+    output = args.output
+    if output is None:
+        output = Path(__file__).resolve().parents[1] / "data" / (
+            f"labeled_data_restrictedfixed_{args.q}_{args.depth}_{args.sigma}_{args.q_eff}_{args.seed}.npy"
+        )
+    output = output.expanduser().resolve()
+    if output.suffix != ".npy":
+        output = output.with_suffix(".npy")
+
+    data = generate_dataset(
+        args.q,
+        args.depth,
+        args.sigma,
+        args.q_eff,
+        args.seed,
+        N_trials=args.n_trials,
+        k=args.factorized_layers,
+        workers=args.workers,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.save(output, data)
+    print(f"Saved {args.n_trials} samples to {output}")

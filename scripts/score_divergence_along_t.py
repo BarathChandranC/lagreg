@@ -360,7 +360,7 @@ def load_epoch_weights_once(model_path: Path, exp_cache: dict, epoch: int, devic
     exp = exp_cache[model_path]
     ckpt = model_path / f"test_model_script_epoch_{epoch}.pt"
 
-    if (not ckpt.exists()) or (not load_checkpoint(exp["model"], str(ckpt), device, training=False)):
+    if (not ckpt.exists()) or (not load_checkpoint(exp["model"], str(ckpt), device=device, training=False)):
         raise RuntimeError(f"Checkpoint load failed: {ckpt}")
     
     exp["model"].eval()
@@ -893,7 +893,7 @@ def main(args):
         # But train_size isn't in params - use reduced_length as the training region boundary
         li = pick_i * reduced_length
         ri = li + reduced_length  # Training region ends at reduced_length
-        test_start = ri
+        test_start = ri if args.test_block_i is None else args.test_block_i * reduced_length
         test_end = min(test_start + args.N_test, len(sequences_ref))
         test_idx = list(range(test_start, test_end))
         test_seqs = sequences_ref[test_idx].long()
@@ -1061,14 +1061,22 @@ def main(args):
             device=sequences.device,
         )
 
-        # Shared test set disjoint from BOTH train blocks (index+content)
-        test_idx = build_shared_test_idx_disjoint_by_content(
-            sequences=sequences,
-            train_idx1=train_idx1,
-            train_idx2=train_idx2,
-            N_test=args.N_test,
-            seed=args.seed,
-        )
+        if args.test_block_i is None:
+            test_idx = build_shared_test_idx_disjoint_by_content(
+                sequences=sequences,
+                train_idx1=train_idx1,
+                train_idx2=train_idx2,
+                N_test=args.N_test,
+                seed=args.seed,
+            )
+        else:
+            if reduced_length1 != reduced_length2:
+                raise ValueError("A fixed test block requires equal reduced lengths for paired models")
+            test_start = args.test_block_i * reduced_length1
+            test_end = test_start + args.N_test
+            if test_end > num_seqs:
+                raise ValueError(f"Test block [{test_start}:{test_end}] exceeds dataset size {num_seqs}")
+            test_idx = torch.arange(test_start, test_end, device=sequences.device)
 
         # Select test sequences
         test_seqs = sequences[test_idx]
@@ -1240,6 +1248,8 @@ if __name__ == "__main__":
                    help="Third train size (e.g., 70000 for 70k model).")
 
     p.add_argument("--N-test", dest="N_test", type=int, default=2000)
+    p.add_argument("--test-block-i", type=int, default=None,
+                   help="Use this fixed reduced-length block for test data instead of discovery.")
 
     p.add_argument("--which-epoch1", type=int, required=True,
                    help="Epoch for --train-size model. Should be the test-loss "
