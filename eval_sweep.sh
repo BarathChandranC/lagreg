@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-REPO=/scratch/work/chandrb1/biased-generalization
+REPO=${REPO:-$(git -C "$SLURM_SUBMIT_DIR" rev-parse --show-toplevel)}
 BATCH=512
 TARGET_STEPS=100000
 

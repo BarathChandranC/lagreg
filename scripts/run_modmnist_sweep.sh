@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-REPO=/scratch/work/chandrb1/biased-generalization
+REPO=${REPO:-$(git -C "$SLURM_SUBMIT_DIR" rev-parse --show-toplevel)}
 K=5
 TILE=14
 POOL_PER_DIGIT=100
