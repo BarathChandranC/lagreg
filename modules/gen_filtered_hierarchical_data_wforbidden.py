@@ -144,34 +144,67 @@ def gen_tree(sample_index, M, l, q, k, probs, seed):
     return x0,leaves
 
 
-def generate_dataset(q, l, sigma, q_eff, seed, N_trials=int(1e6), k=0, workers=None):
-    if N_trials <= 0:
-        raise ValueError("N_trials must be positive")
+def generate_dataset(q, l, sigma, q_eff, seed, N_trials=int(1e6),
+                            k=0, workers=None, max_rounds=50):
+    """
+    Same as generate_dataset, but guarantees the returned (x0, leaves) pairs
+    are pairwise distinct. Only meaningful when the support q*q_eff**(2**l-1)
+    comfortably exceeds N_trials -- otherwise this will not converge.
+    """
     workers = cpu_count() if workers is None else int(workers)
-    if workers <= 0:
-        raise ValueError("workers must be positive")
 
-    # Preserve the historical seed-0 grammar while giving every sample an
-    # index-derived RNG stream that is independent of worker scheduling.
     grammar_rng = np.random.RandomState(seed)
-    M,restrictions = get_M_wforbidden(q, sigma, q_eff, rng=grammar_rng)
-    probs = get_P_xlevel_root(M,k)
+    M, restrictions = get_M_wforbidden(q, sigma, q_eff, rng=grammar_rng)
+    probs = get_P_xlevel_root(M, k)
+
+    support = q * (q_eff ** (2 ** l - 1))
+    if N_trials > support:
+        raise ValueError(
+            f"N_trials={N_trials} exceeds the grammar's support ({support}); "
+            f"unique sampling is impossible."
+        )
 
     x0s = np.empty(N_trials)
-    xis = np.empty((int(2**l),N_trials),dtype=np.int8) # Save as integers to save memory
-    worker = partial(gen_tree, M=M, l=l, q=q, k=k, probs=probs, seed=seed)
-    if workers == 1:
-        runs = map(worker, range(N_trials))
-        for h, (root, leaves) in enumerate(runs):
-            x0s[h], xis[:, h] = root, leaves
-    else:
-        chunksize = max(1, N_trials // (workers * 16))
-        with Pool(workers) as pool:
-            for h, (root, leaves) in enumerate(pool.imap(worker, range(N_trials), chunksize=chunksize)):
-                x0s[h], xis[:, h] = root, leaves
-    
-    return np.array([q,l,sigma,x0s,xis,M,restrictions],dtype=object)
+    xis = np.empty((int(2 ** l), N_trials), dtype=np.int8)
+    seen = set()
+    filled = 0
+    next_index = 0  # global index into the seed-derived RNG stream
 
+    def draw_batch(indices):
+        worker = partial(gen_tree, M=M, l=l, q=q, k=k, probs=probs, seed=seed)
+        if workers == 1:
+            return [worker(i) for i in indices]
+        chunksize = max(1, len(indices) // (workers * 16))
+        with Pool(workers) as pool:
+            return list(pool.imap(worker, indices, chunksize=chunksize))
+
+    for round_i in range(max_rounds):
+        remaining = N_trials - filled
+        if remaining <= 0:
+            break
+        # Slight over-draw accounts for the collisions we expect to hit.
+        batch_size = max(remaining, int(remaining * 1.05) + 1)
+        batch_indices = range(next_index, next_index + batch_size)
+        next_index += batch_size
+
+        for root, leaves in draw_batch(batch_indices):
+            key = (int(root), leaves.tobytes())
+            if key in seen:
+                continue
+            seen.add(key)
+            x0s[filled] = root
+            xis[:, filled] = leaves
+            filled += 1
+            if filled == N_trials:
+                break
+    else:
+        raise RuntimeError(
+            f"Failed to reach {N_trials} unique samples after {max_rounds} "
+            f"rounds ({filled} found). Support may be too small relative to "
+            f"N_trials, or max_rounds too low."
+        )
+
+    return np.array([q, l, sigma, x0s, xis, M, restrictions], dtype=object)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate the controlled hierarchical dataset deterministically.")
@@ -180,7 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--q", type=int, default=6)
     parser.add_argument("--depth", type=int, default=4)
-    parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--sigma", type=float, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--factorized-layers", type=int, default=0)
     parser.add_argument("--q-eff", type=int, default=4)

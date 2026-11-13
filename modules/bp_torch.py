@@ -298,7 +298,9 @@ class TreeBeliefPropagation(nn.Module):
         # Initialize message arrays
         msgs_from_leaves = [None] * (self.depth + 1)
         msgs_from_root = [None] * (self.depth + 1)
-        
+
+        leaves_log_probs = leaves_log_probs.to(probs.dtype)
+                                               
         # PHASE 1: Standard down-pass from leaves up to level k
         msgs_from_leaves[self.depth] = self.normalize(leaves_log_probs)
         

@@ -447,3 +447,5 @@ def create_model(params: dict, vocab_size: int, seq_len: int, device: torch.devi
     in_channels = vocab_size
 
     return model, in_channels, hidden_size_encoder
+
+

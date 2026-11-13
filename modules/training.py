@@ -135,6 +135,7 @@ def train_model(
     use_cross_entropy_loss=True,
     scheduler=None,
     checkpointing_period_epochs=None,
+    checkpointing_period_steps=None,   # NEW: mutually exclusive with the epoch version
     model_dir=None,
     checkpoint_id=None,
     save_final_model=False,
@@ -142,6 +143,8 @@ def train_model(
     epoch_start=0,
     reweighting=False,
     rescale_loss=False,
+    ladder_eval_fn=None,        # NEW: callable(model) -> Dict[str, float]
+    ladder_log_path=None,       # NEW: incremental JSON dump
 ):
     """
     Train a model.
@@ -180,8 +183,11 @@ def train_model(
     else:
         print('No learning rate scheduler provided.')
 
+    if checkpointing_period_epochs is not None and checkpointing_period_steps is not None:
+        raise ValueError("Specify only one of checkpointing_period_epochs / checkpointing_period_steps.")
+
     # Set up model checkpointing
-    if (checkpointing_period_epochs is not None) or save_final_model:
+    if (checkpointing_period_epochs is not None) or (checkpointing_period_steps is not None) or save_final_model:
         if not os.path.exists(model_dir):
             print(f'Creating directory for saving model: {model_dir}')
             os.makedirs(model_dir)
@@ -189,19 +195,38 @@ def train_model(
         with open(model_params_path, 'w') as f:
             json.dump(model.get_params_dict(), f)
 
-    # Set the checkpoint epochs to save        
+    # Epoch-based schedule (unchanged, kept for backward compatibility)
     if checkpointing_period_epochs is not None:
-        epochs_to_save = torch.logspace(2, torch.log10(torch.tensor(n_epochs)), checkpointing_period_epochs).long().tolist()
-        print(f'Epochs to save: {epochs_to_save}')
+        epochs_to_save = set(torch.logspace(2, torch.log10(torch.tensor(n_epochs)), checkpointing_period_epochs).long().tolist())
+        print(f'Epochs to save: {sorted(epochs_to_save)}')
     else:
-        epochs_to_save = []
-   
+        epochs_to_save = set()
+
+    steps_to_save = set()
+    if checkpointing_period_steps is not None:
+        dataset_len_estimate = len(x0s)
+        steps_per_epoch = -(-dataset_len_estimate // batch_size)  # ceil
+        total_steps = n_epochs * steps_per_epoch
+        steps_to_save = set(torch.logspace(2, torch.log10(torch.tensor(total_steps)), checkpointing_period_steps).long().tolist())
+        print(f'Total steps ~{total_steps} (steps/epoch={steps_per_epoch}). Steps to save: {sorted(steps_to_save)}')
+
     epoch_counter = epoch_start
+    global_step = epoch_start * (-(-len(x0s) // batch_size))
+    
     training_history = {
         'training_loss': [],
-        'learning_rate': []
+        'learning_rate': [],
+        'ladder': [],   
     }
-
+    
+    def _run_ladder(tag_key, tag_val):
+        if ladder_eval_fn is None:
+            return
+        training_history['ladder'].append({tag_key: int(tag_val), **ladder_eval_fn(model)})
+        if ladder_log_path is not None:
+            with open(ladder_log_path, 'w') as _f:
+                json.dump(training_history['ladder'], _f, indent=2)
+                
     # Initialize diffusion dataset
     dataset = DiffusionDataset(x0s, t_final, alpha_bars,
                             reweight=reweighting,
@@ -229,6 +254,7 @@ def train_model(
             training_loss_batches = []
 
             for batch in training_loader:
+                global_step += 1
                 xts_batch, x0s_batch, timesteps_batch = batch
                 xts_batch = xts_batch.to(device, non_blocking=True)
                 x0s_batch = x0s_batch.to(device, non_blocking=True)
@@ -248,32 +274,52 @@ def train_model(
                     alphas=alphas,
                     scaler=scaler,
                 )
-                training_loss_batches.append(loss_batch.mean())
+                training_loss_batches.append(loss_batch.mean().item())
+                if scheduler is not None:
+                    scheduler.step()
+                # Update learning rate at the end of the epoch
 
-            # Update learning rate at the end of the epoch
-            if scheduler is not None:
-                scheduler.step()
+                # Save checkpoints
+                if checkpointing_period_steps is not None and global_step in steps_to_save:
+                        checkpoint_path = os.path.join(
+                            model_dir,
+                            checkpoint_id + f'_step_{global_step}.pt'
+                        )
+                        torch.save(
+                            {
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'training_history': training_history,
+                                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                                'count_fun': count_fun,
+                                'global_step': global_step,
+                                'epoch': epoch_counter,
+                            },
+                            checkpoint_path
+                        )
+                        _run_ladder('step', global_step) 
 
-            # Save checkpoints
-            if checkpointing_period_epochs is not None:
-                if epoch_counter in epochs_to_save:
-                    checkpoint_path = os.path.join(
-                        model_dir, 
-                        checkpoint_id + f'_epoch_{epoch_counter}.pt'
-                    )
-                    torch.save(
-                        {
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'training_history': training_history,
-                            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-                            'count_fun': count_fun
-                        },
-                        checkpoint_path
-                    )
-
+            if checkpointing_period_epochs is not None and epoch_counter in epochs_to_save:
+                checkpoint_path = os.path.join(
+                    model_dir,
+                    checkpoint_id + f'_epoch_{epoch_counter}.pt'
+                )
+                torch.save(
+                    {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'training_history': training_history,
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                        'count_fun': count_fun
+                    },
+                    checkpoint_path
+                )
+                _run_ladder('epoch', epoch_counter)
+            
+            
+                
             # Compute the average training loss for the epoch
-            epoch_loss = torch.tensor(training_loss_batches).mean()
+            epoch_loss = float(torch.tensor(training_loss_batches).mean())
             training_history['training_loss'].append(epoch_loss)
             training_history['learning_rate'].append(
                 optimizer.state_dict()['param_groups'][0]['lr']
@@ -289,9 +335,14 @@ def train_model(
 
     # Save the final model checkpoint if required
     if save_final_model:
+        if checkpointing_period_steps is not None:
+            final_tag = f"step_{global_step}"
+        else:
+            final_tag = f"epoch_{epoch_counter}"
+    
         final_checkpoint_path = os.path.join(
-            model_dir, 
-            checkpoint_id + f'_epoch_{epoch_counter}.pt'
+            model_dir,
+            checkpoint_id + f'_{final_tag}.pt'
         )
         torch.save(
             {
@@ -299,7 +350,9 @@ def train_model(
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'training_history': training_history,
-                'count_fun': count_fun
+                'count_fun': count_fun,
+                'global_step': global_step,
+                'epoch': epoch_counter,
             },
             final_checkpoint_path
         )
