@@ -15,7 +15,9 @@ x = gradient steps (log). Columns:
      to the projection emp n's, labelled "pop-referenced" -- those are NOT a
      split of the training loss.
   3  generated-sample composition in %: memorized / valid / global (hallucinated)
-     / local (bad), with valid|recognised and the 1/K chance line
+     / local (bad), with valid|recognised and the rule's own chance line
+     (1/K for mod-K; for a rule with non-uniform marginals it is
+     sum_valid prod_i marg_i, read from full_params.json)
   4  composite FID, with the real-data floor
   5  memorized samples, %
   6  test loss (t-averaged, held-out), with the Bayes floor C
@@ -27,10 +29,13 @@ from the per-t keys with the same weights train_modmnist.py uses.
 
 Usage (from modmnist/scripts):
     python plot_modmnist.py --root ../results_modmnist/K5_tile14 --flag pool100
+    python plot_modmnist.py --root ../results_modmnist/K5_tile14 \
+        --flags pool100v2,pool100v2_reg0p1,pool100v2_reg0p5 --seeds 0,1,2
 """
 import json
 import re
 from argparse import ArgumentParser
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +61,7 @@ plt.rcParams.update({
 
 # ------------------------------------------------------------------ loading
 
-def discover(root, flag, n_vals):
+def discover(root, flag, n_vals, seeds=None):
     runs, flags_seen = {}, set()
     for d in sorted(Path(root).iterdir()):
         m = RUN_RE.match(d.name)
@@ -68,6 +73,8 @@ def discover(root, flag, n_vals):
             continue
         N = int(m.group(2))
         if n_vals and N not in n_vals:
+            continue
+        if seeds and int(m.group(1)) not in seeds:
             continue
         runs.setdefault(N, []).append((int(m.group(1)), d))
     if flag is None and len(flags_seen) > 1:
@@ -133,40 +140,52 @@ def load_run(d):
 
 
 class Group:
-    """All seeds of one N, aligned on their common eval steps."""
+    """All seeds of one N on the UNION of their eval steps, so runs that are
+    still going can be plotted: at each step, mean and s.e.m. are over the
+    seeds that have reached it (the tail can rest on fewer seeds). With
+    common=True, only steps every seed has reached are kept."""
 
-    def __init__(self, N, seed_dirs):
+    def __init__(self, N, seed_dirs, common=False):
         self.N = N
         loaded = [load_run(d) for _, d in sorted(seed_dirs)]
         self.seeds = [s for s, _ in sorted(seed_dirs)]
         self.params = loaded[0][1]
         self.t_list = loaded[0][2]
         self.K = int(self.params.get("K", 5))
-        steps = sorted(set.intersection(*[{r["step"] for r in rows} for rows, _, _ in loaded]))
+        # chance level for valid|recognised: the rule's own value when logged
+        # (non-uniform marginals make it != 1/K), else 1/K for mod-K.
+        self.chance = float(self.params.get("rule_chance", 1.0 / self.K))
+        sets = [{r["step"] for r in rows} for rows, _, _ in loaded]
+        steps = sorted(set.intersection(*sets) if common else set.union(*sets))
         self.steps = np.array(steps, float)
         by = [{r["step"]: r for r in rows} for rows, _, _ in loaded]
-        self.rows = [[b[s] for s in steps] for b in by]           # [seed][step] -> row
+        self.rows = [[b.get(s) for s in steps] for b in by]      # [seed][step] -> row or None
+        self.last_step = [max(st) for st in sets]                 # per seed: how far it got
 
     def has(self, key):
-        return any(key in r for rows in self.rows for r in rows)
+        return any(r is not None and key in r for rows in self.rows for r in rows)
 
     def mat(self, key):
         """(n_seeds, n_steps) float array, NaN where missing / None."""
         def val(r):
+            if r is None:
+                return np.nan
             v = r.get(key)
             return float(v) if isinstance(v, (int, float)) and v is not None else np.nan
         return np.array([[val(r) for r in rows] for rows in self.rows])
 
     def mean_sem(self, key):
         m = self.mat(key)
-        with np.errstate(all="ignore"):
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # steps reached by <= 1 seed
             mu = np.nanmean(m, 0)
             n = np.sum(~np.isnan(m), 0)
             se = np.where(n > 1, np.nanstd(m, 0, ddof=1) / np.sqrt(np.maximum(n, 1)), 0.0)
         return mu, se
 
     def last_hist(self, key):
-        hs = [np.asarray(rows[-1].get(key), float) for rows in self.rows if rows[-1].get(key)]
+        lasts = [next((r for r in reversed(rows) if r is not None), None) for rows in self.rows]
+        hs = [np.asarray(r.get(key), float) for r in lasts if r is not None and r.get(key)]
         if not hs:
             return None
         hs = [h / h.sum() for h in hs]
@@ -207,8 +226,9 @@ def missing(ax, what):
 
 def finish_rows(axes, groups, xlabel="gradient steps"):
     for r, g in enumerate(groups):
-        axes[r, 0].set_ylabel(f"N = {g.N:g}" + (f"\n({len(g.seeds)} seeds)" if len(g.seeds) > 1 else ""),
-                              fontsize=9)
+        lo, hi = min(g.last_step), max(g.last_step)
+        prog = f"step {hi:,}" if lo == hi else f"steps {lo:,}-{hi:,}"
+        axes[r, 0].set_ylabel(f"N = {g.N:g}\n{len(g.seeds)} seed(s), {prog}", fontsize=9)
     for ax in axes[-1]:
         ax.set_xlabel(xlabel)
     for ax in axes.flat:
@@ -277,7 +297,7 @@ def figure(groups, out):
             if g.has("valid_given_recognised"):
                 mu, _ = g.mean_sem("valid_given_recognised")
                 a[1].plot(g.steps[m], 100 * mu[m], color=INK, label="valid | recognised")
-            a[1].axhline(100 / g.K, color=INK, lw=1, ls=":", label="1/K (chance)")
+            a[1].axhline(100 * g.chance, color=INK, lw=1, ls=":", label="chance")
             a[1].set_ylim(0, 100)
         else:
             missing(a[1], "samples")
@@ -330,15 +350,19 @@ def figure(groups, out):
 
 def main(a):
     n_vals = {int(x) for x in a.n_vals.split(",")} if a.n_vals else None
-    runs = discover(a.root, a.flag, n_vals)
-    groups = [Group(N, sd) for N, sd in runs.items()]
+    seeds = {int(x) for x in a.seeds.split(",")} if a.seeds else None
+    flags = a.flags.split(",") if a.flags else [a.flag]
     out = Path(a.out_dir or Path(a.root) / "plots")
     out.mkdir(parents=True, exist_ok=True)
-    for g in groups:
-        print(f"N={g.N:>7}  seeds {g.seeds}  {len(g.steps)} common eval steps (last {g.steps[-1]:.0f})")
-    path = out / "modmnist_summary.png"
-    figure(groups, path)
-    print(f"wrote {path}")
+    for flag in flags:
+        runs = discover(a.root, flag, n_vals, seeds)
+        groups = [Group(N, sd, common=a.common_steps) for N, sd in runs.items()]
+        print(f"--- flag {flag!r}")
+        for g in groups:
+            print(f"N={g.N:>7}  seeds {g.seeds}  last step per seed {g.last_step}")
+        name = "modmnist_summary" + (f"_{flag}" if flag else "") + ".png"
+        figure(groups, out / name)
+        print(f"wrote {out / name}")
 
 
 if __name__ == "__main__":
@@ -347,6 +371,13 @@ if __name__ == "__main__":
     p.add_argument("--flag", default=None,
                    help="Run-folder suffix to select (e.g. pool100); \"\" = no suffix. "
                         "Required when several suffixes exist.")
+    p.add_argument("--flags", default=None,
+                   help="Comma-separated suffixes, one figure each, e.g. "
+                        "pool100v2,pool100v2_reg0p1,pool100v2_reg0p5. Overrides --flag.")
+    p.add_argument("--seeds", default=None, help="Comma-separated seeds to include (default: all).")
+    p.add_argument("--common-steps", action="store_true",
+                   help="Only plot eval steps every seed has reached (default: all steps, "
+                        "averaging over the seeds that have reached each one).")
     p.add_argument("--n-vals", default=None, help="Comma-separated N to include.")
     p.add_argument("--out-dir", default=None)
     main(p.parse_args())

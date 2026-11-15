@@ -2,7 +2,7 @@
 Train the tile classifier used to sort generated samples (digits 0-9 + REJECT).
 Run ONCE per tile size before a sweep, on a GPU:
 
-    srun --gpus=1 --time=00:30:00 --mem=16G python -u train_tile_classifier.py --tile-size 14
+    srun --gpus=1 --time=00:30:00 --mem=16G python -u train_tile_classifier.py
 
 Writes ../checkpoints/tile_cnn_tile{s}.pt (weights + fitted temperature +
 full validation/test report) and, unless --no-preview, a PNG next to it
@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from modules.data import load_mnist, preprocess_tiles
+from modules.data import TILE_SIZE, load_mnist, preprocess_tiles
 from modules.tile_classifier import (train_tile_classifier, save_tile_classifier,
                                      make_negatives, augment, NEG_TYPES, REJECT)
 
@@ -71,7 +71,6 @@ def preview(clf, X, Y, device, out_png, conf_thresh, n_per_row=10):
 
 if __name__ == "__main__":
     p = ArgumentParser()
-    p.add_argument("--tile-size", type=int, default=14, choices=[7, 14, 28])
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -92,9 +91,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
     xtr, ytr, xte, yte = load_mnist(args.mnist_root, args.mnist_npz)
-    s = args.tile_size
+    s = TILE_SIZE
     clf, report = train_tile_classifier(
-        preprocess_tiles(xtr, s), ytr, preprocess_tiles(xte, s), yte, s, device,
+        preprocess_tiles(xtr), ytr, preprocess_tiles(xte), yte, s, device,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, neg_frac=args.neg_frac,
         val_size=args.val_size, conf_thresh=args.conf_thresh, width=args.width, seed=args.seed)
 
@@ -107,7 +106,7 @@ if __name__ == "__main__":
 
     if not args.no_preview:
         try:
-            Xte = preprocess_tiles(xte, s).unsqueeze(1).to(device)
+            Xte = preprocess_tiles(xte).unsqueeze(1).to(device)
             Yte = torch.as_tensor(yte).long().to(device)
             png = out.with_name(out.stem + "_preview.png")
             preview(clf, Xte, Yte, device, png, args.conf_thresh)

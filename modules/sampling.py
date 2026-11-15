@@ -15,6 +15,8 @@ Categories (mutually exclusive, sum to 1), in precedence order:
 Reference point: a sampler that gets every tile right but ignores the
 coupling has valid / (valid + global) = 1/K.
 """
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,10 +28,14 @@ from .data import to_tiles
 
 @torch.no_grad()
 def ddim_sample(model, sched, n, img_size, device, n_steps=250, eta=1.0,
-                batch_size=1024, generator=None):
+                batch_size=1024, generator=None, amp=None):
     """
     DDIM with stochasticity eta (eta=1 ~ ancestral DDPM on the strided grid,
     eta=0 deterministic). x0-hat is clipped to [-1,1] before the update.
+
+    amp = torch.float16 / torch.bfloat16 runs the DENOISER forward in that dtype
+    (the DDIM update arithmetic stays fp32). Roughly 2x. Safe here because the
+    samples are only classified / FID'd. V100 has fp16 tensor cores but no bf16.
     """
     model.eval()
     T = sched.T
@@ -43,7 +49,11 @@ def ddim_sample(model, sched, n, img_size, device, n_steps=250, eta=1.0,
             ab = sched.abar[t - 1].float()
             ab_prev = (sched.abar[ts[k + 1] - 1].float() if k + 1 < len(ts)
                        else torch.tensor(1.0, device=device))
-            e = model(x, tb).float()
+            with (torch.autocast("cuda", dtype=amp)
+                  if amp is not None and device.type == "cuda"
+                  else contextlib.nullcontext()):
+                e = model(x, tb)
+            e = e.float()
             x0 = ((x - (1 - ab).sqrt() * e) / ab.sqrt()).clamp(-1, 1)
             e = (x - ab.sqrt() * x0) / (1 - ab).sqrt()                  # consistent with clipped x0
             sig = eta * ((1 - ab_prev) / (1 - ab) * (1 - ab / ab_prev)).clamp_min(0).sqrt()
@@ -97,8 +107,8 @@ def memorized_mask(d1, d2, D, rule="ratio", ratio=1 / 3, rms=0.1):
 
 
 @torch.no_grad()
-def classify_samples(gen, clf, K, train_imgs, conf_thresh=0.9, mem_rule="ratio",
-                     mem_ratio=1 / 3, mem_rms=0.1):
+def classify_samples(gen, clf, rule, train_imgs, conf_thresh=0.9, mem_rule="ratio",
+                     mem_ratio=1 / 3, mem_rms=0.1, return_per_sample=False):
     n = gen.shape[0]
     s = gen.shape[-1] // 2
     tiles = to_tiles(gen).view(n * 4, 1, s, s)
@@ -107,10 +117,10 @@ def classify_samples(gen, clf, K, train_imgs, conf_thresh=0.9, mem_rule="ratio",
     conf, cls = probs.max(-1)                                         # (n,4)
     is_digit = cls < 10                                               # not REJECT
     digit = probs[..., :10].argmax(-1)
-    residue = digit % K
+    residue = digit % rule.C
     tile_ok = is_digit & (conf >= conf_thresh)
     recognised = tile_ok.all(1)
-    sat = (residue.sum(1) % K) == 0
+    sat = rule.satisfies(residue)
 
     d1, d2 = nn_distances(gen, train_imgs)
     mem = memorized_mask(d1, d2, gen[0].numel(), mem_rule, mem_ratio, mem_rms)
@@ -119,7 +129,7 @@ def classify_samples(gen, clf, K, train_imgs, conf_thresh=0.9, mem_rule="ratio",
     glob = novel & recognised & ~sat
     loc = novel & ~recognised
     n_rec = int((novel & recognised).sum())
-    return {
+    out = {
         "memorized": float(mem.float().mean()),
         "valid": float(valid.float().mean()),
         "local": float(loc.float().mean()),
@@ -129,6 +139,98 @@ def classify_samples(gen, clf, K, train_imgs, conf_thresh=0.9, mem_rule="ratio",
         "valid_given_recognised": (float(valid.sum()) / n_rec) if n_rec else float("nan"),
         "nn_dist_mean": float(d1.mean()),
         "nn_ratio_mean": float((d1 / d2).mean()),
-        "residue_hist": torch.bincount(residue.flatten(), minlength=K).tolist(),
-        "sum_mod_hist": torch.bincount(residue.sum(1) % K, minlength=K).tolist(),
+        "residue_hist": torch.bincount(residue.flatten(), minlength=rule.C).tolist(),
+        "sum_hist": torch.bincount(residue.sum(1), minlength=1).tolist(),
     }
+    if not return_per_sample:
+        return out
+    per = {"valid": valid, "global": glob, "local": loc, "memorized": mem,
+           "residue": residue, "conf": conf, "tile_ok": tile_ok, "sat": sat,
+           "recognised": recognised, "d1": d1, "d2": d2}
+    return out, per
+
+
+# ------------------------------------------------------- viewable sample dumps
+
+CATEGORIES = ("valid", "global", "local", "memorized")
+
+
+def _show(ax, img):
+    ax.imshow((img.float().cpu() + 1) / 2, cmap="gray", vmin=0, vmax=1,
+              interpolation="nearest")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def _readout(per, i, rule):
+    """'3 4 | 2 5  sum 7=7  OK' -- the classifier's read-out of one sample,
+    slots row-major (TL TR / BL BR). '?' marks a tile below conf_thresh."""
+    ok = per["tile_ok"][i]
+    r = per["residue"][i].tolist()
+    s = [str(v) if bool(ok[k]) else "?" for k, v in enumerate(r)]
+    head = f"{s[0]} {s[1]} / {s[2]} {s[3]}"
+    if not bool(ok.all()):
+        return head + "  (tile unread)"
+    tag = "rule OK" if bool(per["sat"][i]) else "rule BROKEN"
+    if rule.name.startswith("sumpair"):
+        head += f"   {r[0]}+{r[1]}={r[0] + r[1]} vs {r[2]}+{r[3]}={r[2] + r[3]}"
+    elif rule.name.startswith(("modk", "checksum")):
+        head += f"   sum={sum(r) % rule.C} mod {rule.C}"
+    return head + f"\n{tag}"
+
+
+def save_sample_png(path, gen, per, rule, n_per_cat=1, dpi=110):
+    """
+    One actual image per sample category (valid / global / local / memorized),
+    titled with what the tile classifier read off it. This is the sanity check
+    the scalar rates cannot give: whether a 'valid' sample really is four clean
+    digits obeying the rule, or whether the classifier is being fooled.
+
+    Returns {category: count in this batch}.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    cols = max(1, int(n_per_cat))
+    counts = {c: int(per[c].sum()) for c in CATEGORIES}
+    fig, axes = plt.subplots(len(CATEGORIES), cols, squeeze=False,
+                             figsize=(2.3 * cols, 2.7 * len(CATEGORIES)))
+    for r, cat in enumerate(CATEGORIES):
+        idx = per[cat].nonzero(as_tuple=True)[0][:cols]
+        for j in range(cols):
+            ax = axes[r][j]
+            if j >= len(idx):
+                ax.axis("off")
+                if j == 0:
+                    ax.text(0.5, 0.5, f"{cat}\n(none in this batch)", ha="center",
+                            va="center", fontsize=9, color="0.4")
+                continue
+            i = int(idx[j])
+            _show(ax, gen[i, 0])
+            ttl = _readout(per, i, rule)
+            if j == 0:
+                ttl = f"[{cat}]  {counts[cat]}/{gen.shape[0]}\n" + ttl
+            ax.set_title(ttl, fontsize=8, fontfamily="monospace")
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+    return counts
+
+
+def save_sample_grid(path, gen, n=8, dpi=110):
+    """Plain n x n grid of the first n*n samples -- overall image quality at a glance."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = max(1, min(int(n), int(gen.shape[0] ** 0.5)))
+    fig, axes = plt.subplots(n, n, squeeze=False, figsize=(1.1 * n, 1.1 * n))
+    for k in range(n * n):
+        ax = axes[k // n][k % n]
+        _show(ax, gen[k, 0])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    fig.subplots_adjust(wspace=0.04, hspace=0.04, left=0.01, right=0.99, top=0.99, bottom=0.01)
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)

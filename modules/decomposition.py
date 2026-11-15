@@ -66,6 +66,7 @@ n_global = R_global / E||m^glob||^2 (zero predictor -> 1, Bayes -> 0). At low
 noise E||m^glob||^2 can be tiny; `glob_energy` is logged so those t can be
 excluded downstream instead of trusted.
 """
+import contextlib
 import math
 
 import torch
@@ -80,7 +81,7 @@ def _se(x):
 
 class DecompositionEvaluator:
     def __init__(self, oracle, sched, x0, t_list, n_completions=16, seed=0,
-                 batch_size=1024, label="pop"):
+                 batch_size=1024, label="pop", amp=None):
         if n_completions < 2:
             raise ValueError("need n_completions >= 2 for the unbiased U-statistic")
         self.oracle, self.sched = oracle, sched
@@ -89,6 +90,12 @@ class DecompositionEvaluator:
         self.D = 4 * self.d
         self.M = int(n_completions)
         self.batch_size = int(batch_size)
+        # Optional autocast dtype for the denoiser forward ONLY; every estimator
+        # below accumulates in fp32. fp16 (11-bit significand, rel. err ~5e-4 on
+        # outputs of order 1) adds a ~0.04% bias to R_global, which is E||m_glob||^2
+        # ~ 6.5e-4 per pixel -- acceptable. bf16 (8-bit, ~4e-3) does NOT: its error
+        # alone exceeds E||m_glob||^2. Watch pyth_resid to confirm.
+        self.amp = amp
         self.seed = int(seed)
         self.label = label
         dev = x0.device
@@ -133,13 +140,9 @@ class DecompositionEvaluator:
         # C_i ~ eta_i, fresh per completion
         ci = torch.multinomial(eta.reshape(nb * 4, K), M, replacement=True,
                                generator=gen).view(nb, 4, M)             # (nb,4,M)
-        cls = torch.randint(0, K, (nb, 4, M, 4), device=dev, generator=gen)   # [b,i,m,slot]
         ar = torch.arange(4, device=dev)
-        cls[:, ar, :, ar] = ci.permute(1, 0, 2)                         # slot i <- c_i
-        # the 'last' free slot for region i is (i+3)%4; fix it by the constraint
-        last = (ar + 3) % 4
-        tot = cls.sum(-1) - cls[:, ar, :, last].permute(1, 0, 2)         # sum over the other 3
-        cls[:, ar, :, last] = ((-tot) % K).permute(1, 0, 2)
+        # the other three slots are drawn from the rule's conditional given slot i
+        cls = self.pools.rule.complete(ci, generator=gen)                # (nb,4,M,4)
 
         idx = self.pools.sample_idx(cls, generator=gen)                  # (nb,4,M,4)
         x = self.pools.tiles(idx)                                        # (nb,4,M,4,d)
@@ -166,10 +169,15 @@ class DecompositionEvaluator:
 
     def _forward(self, model, x, t):
         res = []
+        ctx = (torch.autocast("cuda", dtype=self.amp)
+               if self.amp is not None and x.device.type == "cuda"
+               else contextlib.nullcontext())
         for lo in range(0, x.shape[0], self.batch_size):
             xb = x[lo:lo + self.batch_size]
             tb = torch.full((xb.shape[0],), t, dtype=torch.long, device=x.device)
-            res.append(model(xb, tb).float())
+            with ctx:
+                out = model(xb, tb)
+            res.append(out.float())
         return torch.cat(res)
 
     def _eval_one(self, model, it):

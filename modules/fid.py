@@ -6,10 +6,12 @@ tiles' features concatenated into one vector per composite.
   fid_composite  Fréchet distance on those vectors
   kid_composite  unbiased MMD^2, cubic polynomial kernel, same vectors
 
-IMPORTANT -- FID cannot see the mod-K rule. Fréchet distance compares means
-and covariances (1st/2nd order). The rule leaves every set of <= 3 tiles
-independent, so real rule-satisfying composites and real composites with
-independent random residues have identical feature means and covariances.
+IMPORTANT -- whether FID can see the rule DEPENDS ON THE RULE. Frechet distance
+compares means and covariances (1st/2nd order). Under mod-K every set of <= 3
+tiles is exactly independent, so rule-satisfying composites and independent ones
+have identical feature means and covariances, and FID is blind to it. Under a
+pairwise-correlated rule such as c0 + c1 = c2 + c3 that is NOT true: FID does
+see the rule there.
 `fid_norule_floor` (logged once) is the FID between those two real sets:
 it should be ~ the noise floor `fid_real_floor`, which is the empirical
 proof that FID is blind to hallucination here. Use FID for local quality,
@@ -80,8 +82,9 @@ def tile_features(clf, imgs, batch=4096):
 
 
 def sample_composites_norule(pools, n, generator=None):
-    """Real composites with 4 INDEPENDENT uniform residues (rule ignored)."""
-    c = torch.randint(0, pools.K, (n, 4), device=pools.device, generator=generator)
+    """Real composites with 4 INDEPENDENT tiles drawn from the rule's own per-tile
+    marginals -- same 1st-order statistics as the population, rule broken."""
+    c = pools.rule.sample_independent(n, generator=generator, device=pools.device)
     idx = pools.sample_idx(c, generator=generator)
     return from_tiles(pools.tiles(idx), pools.tile_size)
 

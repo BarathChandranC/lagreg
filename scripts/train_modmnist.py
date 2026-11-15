@@ -14,7 +14,7 @@ steps, evaluate IN-PROCESS (no checkpoints written):
   * composition of freshly generated samples:
         memorized / valid / local (locally wrong) / global (globally wrong)
 
-Output: <out-root>/K{K}_tile{s}/seed{seed}_N{N}/
+Output: <out-root>/K{K}_tile32/seed{seed}_N{N}/
           full_params.json
           train_eval_log.json   one row per eval step, keys:
               step, lr, train_loss (running mean since last eval),
@@ -46,26 +46,38 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from modules.data import (load_mnist, preprocess_tiles, ResiduePools,
+from modules.data import (TILE_SIZE, load_mnist, preprocess_tiles, ResiduePools,
                           sample_composites)
 from modules.schedule import CosineSchedule
 from modules.oracle import ModKOracle
+from modules.rules import build as build_rule
 from modules.unet import UNet
+from modules.dit import DiT
 from modules.decomposition import DecompositionEvaluator
-from modules.sampling import ddim_sample, classify_samples
+from modules.sampling import (ddim_sample, classify_samples, save_sample_png,
+                              save_sample_grid)
 from modules.fid import FIDEvaluator
 from modules.regularizer import LagRegularizer
 from modules.tile_classifier import (train_tile_classifier, load_tile_classifier,
                                      save_tile_classifier)
+
+
+AMP_CHOICES = ["none", "fp16", "bf16"]
+AMP_DTYPE = {"none": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def arch_tag(args):
+    return "unet" if args.arch == "unet" else f"dit{args.dit_size}{args.dit_patch}"
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("modmnist")
 
 
 def build_classifier(args, x_tr, y_tr, x_te, y_te, device):
-    path = Path(args.classifier_path or f"../checkpoints/tile_cnn_tile{args.tile_size}.pt")
+    path = Path(args.classifier_path or f"../checkpoints/tile_cnn_tile{TILE_SIZE}.pt")
     if path.exists():
-        clf, rep = load_tile_classifier(path, args.tile_size, device)
+        clf, rep = load_tile_classifier(path, TILE_SIZE, device)
         te = rep.get("test", {})
         log.info("loaded tile classifier %s (test digit acc %.4f, negatives accepted %.4f, T=%.3f)",
                  path, te.get("digit_acc", float("nan")), te.get("neg_accepted", float("nan")),
@@ -76,7 +88,7 @@ def build_classifier(args, x_tr, y_tr, x_te, y_te, device):
         return clf
     log.info("no classifier checkpoint -- training one (run train_tile_classifier.py "
              "beforehand to avoid this inside a sweep)")
-    clf, rep = train_tile_classifier(x_tr, y_tr, x_te, y_te, args.tile_size, device,
+    clf, rep = train_tile_classifier(x_tr, y_tr, x_te, y_te, TILE_SIZE, device,
                                      conf_thresh=args.conf_thresh, seed=1234, log=log.info)
     path.parent.mkdir(parents=True, exist_ok=True)
     save_tile_classifier(clf, rep, path)
@@ -93,14 +105,16 @@ def main(args):
 
     # ---------------------------------------------------------------- data
     xtr_u8, ytr, xte_u8, yte = load_mnist(args.mnist_root, args.mnist_npz)
-    s = args.tile_size
-    x_tr = preprocess_tiles(xtr_u8, s)
-    x_te = preprocess_tiles(xte_u8, s)
+    s = TILE_SIZE
+    x_tr = preprocess_tiles(xtr_u8)
+    x_te = preprocess_tiles(xte_u8)
     # The pool (and therefore the population and the oracle) is fixed by
     # --pool-seed, NOT the run seed, so every (N, seed) run in a sweep shares
     # one population and one oracle.
+    rule = build_rule(args.rule, args.K)
     pools = ResiduePools(x_tr, ytr, args.K, per_digit_cap=args.pool_per_digit,
-                         seed=args.pool_seed, device=device)
+                         seed=args.pool_seed, device=device, rule=rule)
+    log.info("rule: %r  (chance level for independent tiles = %.4f)", rule, rule.chance)
     log.info("pool: K=%d tile=%dx%d sizes per residue %s (total %d)",
              args.K, s, s, pools.sizes.tolist(), pools.flat.shape[0])
 
@@ -108,7 +122,7 @@ def main(args):
     g_pop = torch.Generator(device=device).manual_seed(20_000 + args.pool_seed)
     x_train, c_train, _ = sample_composites(pools, args.n_train, generator=g_train)
     x_pop, _, _ = sample_composites(pools, args.n_eval, generator=g_pop)
-    assert ((c_train.sum(1) % args.K) == 0).all()
+    assert bool(rule.satisfies(c_train).all())
     log.info("train set: %d composites %s | pop eval set: %d", args.n_train,
              tuple(x_train.shape[1:]), args.n_eval)
 
@@ -118,13 +132,14 @@ def main(args):
     log.info("eval t grid: %s (T=%d)", t_list, args.T)
 
     t0 = time.time()
+    eval_dt = AMP_DTYPE[args.eval_amp]
     ev_pop = DecompositionEvaluator(oracle, sched, x_pop, t_list, args.n_completions,
                                     seed=30_000 + args.pool_seed,
-                                    batch_size=args.eval_batch_size, label="pop")
+                                    batch_size=args.eval_batch_size, label="pop", amp=eval_dt)
     n_emp = min(args.n_eval, args.n_train)
     ev_emp = DecompositionEvaluator(oracle, sched, x_train[:n_emp], t_list, args.n_completions,
                                     seed=40_000 + args.seed,
-                                    batch_size=args.eval_batch_size, label="emp")
+                                    batch_size=args.eval_batch_size, label="emp", amp=eval_dt)
     log.info("evaluators built in %.1fs", time.time() - t0)
     for it in ev_pop.items:
         log.info("  t=%4d a=%.3f s=%.3f  E|m_loc|^2=%.4g  E|m_glob|^2=%.4g (per pixel)",
@@ -143,29 +158,75 @@ def main(args):
     # ---------------------------------------------------------------- model
     img = 2 * s
     ch_mult = tuple(int(c) for c in args.ch_mult.split(","))
-    model = UNet(img_size=img, base_ch=args.base_ch, ch_mult=ch_mult, n_res=args.n_res,
-                 attn_res=tuple(int(r) for r in args.attn_res.split(",")),
-                 dropout=args.dropout).to(device)
-    log.info("U-Net params: %.2fM", sum(p.numel() for p in model.parameters()) / 1e6)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.arch == "unet":
+        model = UNet(img_size=img, base_ch=args.base_ch, ch_mult=ch_mult, n_res=args.n_res,
+                     attn_res=tuple(int(r) for r in args.attn_res.split(",")),
+                     dropout=args.dropout).to(device)
+    else:
+        model = DiT(img_size=img, patch=args.dit_patch, in_ch=1, size=args.dit_size,
+                    tile_size=s).to(device)
+    log.info("%s params: %.2fM", arch_tag(args), sum(p.numel() for p in model.parameters()) / 1e6)
+    raw_model = model                      # un-wrapped: state_dict / parameters / grad clipping
+    if args.compile:
+        # dynamic=False: with dynamic=True Inductor keeps the image size symbolic
+        # and its Triton backend asserts out on the DiT's token-count reduction
+        # ("Failed to find static RBLOCK for ((s1//8))**2"). Specialising per shape
+        # avoids that; there are only a handful here (train batch, eval batch, the
+        # partial sampling batch), so it costs a few recompiles once.
+        # suppress_errors: torch.compile is LAZY -- it compiles on the first
+        # forward, inside the training loop, so a try/except around this call
+        # catches nothing. This makes any compile failure fall back to eager
+        # instead of killing the job.
+        try:
+            import torch._dynamo as _dynamo   # NOT `import torch._dynamo`: that binds
+            _dynamo.config.suppress_errors = True   # `torch` as a local for all of main()
+            model = torch.compile(model, dynamic=False)
+            log.info("torch.compile enabled (dynamic=False, errors suppressed to eager)")
+        except Exception as e:             # noqa: BLE001 - never fail a run over an optimisation
+            log.warning("torch.compile unavailable (%s) -- running uncompiled", e)
+    opt = torch.optim.Adam(raw_model.parameters(), lr=args.lr)
 
     regz = None
     if args.reg_lambda > 0 or args.reg_monitor:
         regz = LagRegularizer(oracle, sched, pools, margin=args.reg_margin,
                               n_completions=args.reg_completions,
                               n_ref=args.reg_n_ref, seed=args.pool_seed, log=log.info)
-    sch = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda st: min(1.0, (st + 1) / max(1, args.warmup_steps)))
+    # Linear warm-up to lr, then either hold it (constant) or cosine-decay to
+    # lr_min_frac * lr by the last step -- the RHM sweep's decay shape, so the
+    # two runs differ only in what happens after warm-up.
+    def lr_lambda(st):
+        w = max(1, args.warmup_steps)
+        if st < w:
+            return (st + 1) / w
+        if args.lr_schedule == "constant":
+            return 1.0
+        p = (st - w) / max(1, args.total_steps - w)
+        return args.lr_min_frac + (1 - args.lr_min_frac) * 0.5 * (1 + math.cos(math.pi * p))
+    sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    log.info("lr schedule: %s (lr %.3g, warmup %d steps%s)", args.lr_schedule, args.lr,
+             args.warmup_steps,
+             "" if args.lr_schedule == "constant" else
+             f", cosine to {args.lr_min_frac:g}x = {args.lr * args.lr_min_frac:.3g}")
 
     # ---------------------------------------------------------------- output
     out_dir = Path(args.out_root) / f"K{args.K}_tile{s}" / f"seed{args.seed}_N{args.n_train}"
+    if args.arch != "unet":
+        out_dir = out_dir.with_name(out_dir.name + f"_{arch_tag(args)}")
+    if args.rule != "modk":
+        out_dir = out_dir.with_name(out_dir.name + f"_{rule.name}")
+    if args.lr_schedule != "constant":
+        out_dir = out_dir.with_name(out_dir.name + "_cos")
     if args.add_flag:
         out_dir = out_dir.with_name(out_dir.name + f"_{args.add_flag}")
     if args.reg_lambda > 0:
         out_dir = out_dir.with_name(out_dir.name + "_reg" + str(args.reg_lambda).replace(".", "p"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    img_dir = out_dir / "samples"
+    if args.sample_png > 0:
+        img_dir.mkdir(exist_ok=True)
     with open(out_dir / "full_params.json", "w") as f:
-        json.dump({**vars(args), "t_list": t_list, "pool_sizes": pools.sizes.tolist()}, f, indent=2)
+        json.dump({**vars(args), "t_list": t_list, "pool_sizes": pools.sizes.tolist(),
+                   "rule_n_valid": rule.n_valid, "rule_chance": rule.chance}, f, indent=2)
     # (t-average weights are logged at startup and recomputable from t_list and T)
     log_path = out_dir / "train_eval_log.json"
 
@@ -224,12 +285,28 @@ def main(args):
         if clf is not None:
             gen = ddim_sample(model, sched, args.n_gen, img, device, n_steps=args.sample_steps,
                               eta=args.sample_eta, batch_size=args.eval_batch_size,
-                              generator=torch.Generator(device=device).manual_seed(50_000 + args.seed))
-            row.update(classify_samples(gen, clf, args.K, x_train, conf_thresh=args.conf_thresh,
-                                        mem_rule=args.mem_rule, mem_ratio=args.mem_ratio,
-                                        mem_rms=args.mem_rms))
+                              generator=torch.Generator(device=device).manual_seed(50_000 + args.seed),
+                              amp=AMP_DTYPE[args.sample_amp])
+            want_png = args.sample_png > 0
+            cls_out = classify_samples(gen, clf, rule, x_train, conf_thresh=args.conf_thresh,
+                                       mem_rule=args.mem_rule, mem_ratio=args.mem_ratio,
+                                       mem_rms=args.mem_rms, return_per_sample=want_png)
+            per = None
+            if want_png:
+                cls_out, per = cls_out
+            row.update(cls_out)
             if fid_ev is not None:
                 row.update(fid_ev(gen))
+            if want_png:
+                try:
+                    cnt = save_sample_png(img_dir / f"cats_step{step:07d}.png", gen, per, rule,
+                                          n_per_cat=args.sample_png)
+                    save_sample_grid(img_dir / f"grid_step{step:07d}.png", gen,
+                                     n=args.sample_png_grid)
+                    log.info("samples -> %s  (%s)", img_dir.name,
+                             " ".join(f"{k} {v}" for k, v in cnt.items()))
+                except Exception as e:                       # never lose a run over a plot
+                    log.warning("sample PNG failed (%s)", e)
             if args.save_samples:
                 torch.save(gen[:64].cpu(), out_dir / f"samples_step{step}.pt")
         row["eval_seconds"] = time.time() - t1
@@ -248,7 +325,7 @@ def main(args):
             msg += (f" | mem {row['memorized']:.3f} valid {row['valid']:.3f} "
                     f"local {row['local']:.3f} global {row['global']:.3f} "
                     f"tile_rej {row['tile_rejected']:.3f} "
-                    f"v|rec {row['valid_given_recognised']:.3f} (1/K={1 / args.K:.3f})")
+                    f"v|rec {row['valid_given_recognised']:.3f} (chance={rule.chance:.3f})")
         if reg_stats:
             msg += (f" | batch n_glob {reg_stats['n_global']:.3f} n_loc {reg_stats['n_local']:.3f} "
                     f"lag {reg_stats['lag']:+.3f} reg {reg_stats['reg']:.3g}")
@@ -263,14 +340,18 @@ def main(args):
     model.train()
     acc_loss, acc_n = 0.0, 0
     reg_acc, reg_n = {}, 0
-    amp = (args.amp == "bf16" and device.type == "cuda")
+    train_dt = AMP_DTYPE[args.amp]
+    amp = train_dt is not None and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp and train_dt is torch.float16))
+    if amp and train_dt is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise SystemExit("--amp bf16 needs Ampere or newer (V100 has fp16 only); use --amp fp16")
     for step in range(1, args.total_steps + 1):
         idx = torch.randint(0, args.n_train, (args.batch_size,), device=device, generator=g_train)
         x0 = x_train[idx]
         t = torch.randint(1, args.T + 1, (args.batch_size,), device=device, generator=g_train)
         eps = torch.randn(x0.shape, device=device, generator=g_train)
         zt = sched.q_sample(x0, t, eps)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        with torch.autocast("cuda", dtype=train_dt or torch.float16, enabled=amp):
             pred = model(zt, t)
         main = F.mse_loss(pred.float(), eps)
         loss = main
@@ -279,17 +360,19 @@ def main(args):
             rb = min(args.reg_batch, args.batch_size)
             with torch.set_grad_enabled(apply):            # monitor-only: no graph
                 reg, info = regz(model, pred[:rb], zt[:rb], t[:rb],
-                                 torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp))
+                                 torch.autocast("cuda", dtype=train_dt or torch.float16, enabled=amp))
             if apply:
                 loss = main + args.reg_lambda * reg
             for k, v in info.items():
                 reg_acc[k] = reg_acc.get(k, 0.0) + v
             reg_n += 1
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step()
+            scaler.unscale_(opt)                       # clip on unscaled grads
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
+        scaler.step(opt)
+        scaler.update()
         sch.step()
         acc_loss += float(main.detach()); acc_n += 1          # main loss only (reg logged separately)
         if step in eval_set:
@@ -300,16 +383,29 @@ def main(args):
             model.train()
 
     if args.save_final_model:
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args)},
+        torch.save({"model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "step": int(step), "args": vars(args)},
                    out_dir / "final_model.pt")
+        log.info("saved final model -> %s", out_dir / "final_model.pt")
     log.info("done -> %s", log_path)
 
 
 if __name__ == "__main__":
     p = ArgumentParser(description="mod-K MNIST diffusion: train + exact local/global risk decomposition")
     # data
-    p.add_argument("--K", type=int, default=5)
-    p.add_argument("--tile-size", type=int, default=14, choices=[7, 14, 28])
+    p.add_argument("--K", type=int, default=5,
+                   help="Classes per tile. The tile class is digit %% K, so K=10 means "
+                        "the class IS the digit (required by --rule sumpair).")
+    p.add_argument("--rule", type=str, default="modk",
+                   choices=["modk", "checksum", "sumpair", "pairwise"],
+                   help="Composition rule (modules/rules.py). modk: sum c_i = 0 mod K "
+                        "-- every triple of classes is exactly independent. checksum: "
+                        "c_3 = sum of the others mod K, which is the SAME rule relabelled. "
+                        "sumpair: c_0+c_1 = c_2+c_3 on digits (Lu et al., 670 valid tuples, "
+                        "pairwise correlated, needs --K 10). pairwise: c_3 = c_0, a control "
+                        "isolating four-way structure. Non-default rules are added to the "
+                        "run folder name."),
     p.add_argument("--pool-per-digit", type=int, default=None,
                    help="Cap tiles per digit in the pool (defines the population). "
                         "None = all ~6000/digit. Oracle cost is linear in pool size.")
@@ -321,20 +417,48 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     # model / diffusion
     p.add_argument("--T", type=int, default=1000)
+    p.add_argument("--arch", choices=["unet", "dit"], default="unet",
+                   help="Denoiser. 'dit' adds _dit<size><patch> (e.g. _ditS2) to the run folder.")
+    p.add_argument("--dit-size", choices=["S", "B"], default="S",
+                   help="S: depth 12, hidden 384, 6 heads (~33M). B: depth 12, hidden 768, 12 heads.")
+    p.add_argument("--dit-patch", type=int, default=8,
+                   help="Patch size; should divide the 32px tile (1,2,4,8,16,32). "
+                        "8 gives 64 tokens, 16 per tile -- Lu et al.'s geometry.")
     p.add_argument("--base-ch", type=int, default=64)
-    p.add_argument("--ch-mult", type=str, default="1,2,2",
-                   help="'1,2,2' for 28x28 composites (tile 14); '1,2,2,2' for 56x56 (tile 28).")
+    p.add_argument("--ch-mult", type=str, default="1,2,2,2",
+                   help="64x64 composite -> feature maps 64,32,16,8.")
     p.add_argument("--n-res", type=int, default=2)
-    p.add_argument("--attn-res", type=str, default="7,14")
+    p.add_argument("--attn-res", type=str, default="8,16")
     p.add_argument("--dropout", type=float, default=0.0)
     # optimisation
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup-steps", type=int, default=500)
+    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine"],
+                   help="After warm-up: hold lr (constant, the default) or cosine-decay it to "
+                        "--lr-min-frac x lr by the final step. The RHM sweep uses the cosine "
+                        "shape. Cosine runs get a _cos suffix on the run folder.")
+    p.add_argument("--lr-min-frac", type=float, default=0.1,
+                   help="Final lr as a fraction of --lr, for --lr-schedule cosine.")
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--amp", type=str, default="none", choices=["none", "bf16"],
-                   help="Autocast for the TRAINING forward only; evaluation is always fp32.")
+    p.add_argument("--amp", type=str, default="none", choices=AMP_CHOICES,
+                   help="Autocast for the TRAINING forward (loss still taken in fp32). "
+                        "fp16 additionally enables a GradScaler. V100 has fp16 tensor cores "
+                        "but NO bf16 and no TF32.")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the denoiser (dynamic=False, one graph per batch shape). "
+                        "Speeds up every model call; compile errors fall back to eager rather "
+                        "than killing the run. dynamic=True is NOT used: Inductor's Triton "
+                        "backend asserts on the DiT's symbolic token count.")
+    p.add_argument("--sample-amp", type=str, default="none", choices=AMP_CHOICES,
+                   help="Autocast for the DDIM sampling forward only (~1/3 of each eval). "
+                        "Samples are only classified / FID'd, so the decomposition is untouched.")
+    p.add_argument("--eval-amp", type=str, default="none", choices=AMP_CHOICES,
+                   help="Autocast for the DECOMPOSITION forward (all estimators still accumulate "
+                        "in fp32). fp16's ~5e-4 relative error puts a ~0.04%% bias on R_global and "
+                        "is usable; bf16's ~4e-3 exceeds E||m_glob||^2 ~ 6.5e-4 itself and is NOT. "
+                        "Verify with pyth_resid in the log.")
     # evaluation
     p.add_argument("--n-evals", type=int, default=30)
     p.add_argument("--first-eval-step", type=int, default=50)
@@ -356,7 +480,14 @@ if __name__ == "__main__":
     p.add_argument("--mem-rms", type=float, default=0.1)
     p.add_argument("--classifier-path", type=str, default=None,
                    help="Default ../checkpoints/tile_cnn_tile{tile_size}.pt; trained and saved there if missing.")
-    p.add_argument("--save-samples", action="store_true")
+    p.add_argument("--save-samples", action="store_true",
+                   help="also dump the raw tensor of the first 64 samples per eval")
+    p.add_argument("--sample-png", type=int, default=1,
+                   help="per eval, save <samples/cats_step*.png>: this many actual images "
+                        "from EACH category (valid / global / local / memorized), titled "
+                        "with the tile classifier's read-out. 0 disables both PNGs.")
+    p.add_argument("--sample-png-grid", type=int, default=8,
+                   help="side of the plain n x n sample grid <samples/grid_step*.png>")
     p.add_argument("--fid", action="store_true", default=True,
                    help="FID/KID of the n_gen samples in tile-classifier feature space "
                         "(local quality only -- blind to the mod-K rule, see modules/fid.py).")

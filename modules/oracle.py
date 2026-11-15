@@ -1,5 +1,7 @@
 """
-Exact Bayes oracle for mod-K MNIST, relative to the finite tile pool.
+Exact Bayes oracle for composite MNIST, relative to the finite tile pool and a
+composition rule (modules/rules.py). The rule supplies the per-tile marginal
+prior and the joint class posterior; everything else here is rule-agnostic.
 
 Per tile i and residue c (pool D_c, tile x in D_c):
 
@@ -94,21 +96,8 @@ class ModKOracle:
         return (p.unsqueeze(-2) * q[..., self._conv_idx]).sum(-1)
 
     def joint_class_posterior(self, eta):
-        """eta: (n,4,K) -> pi (n,4,K), A (n,)  with A = K * P_indep(sum C = 0)."""
-        K = self.K
-        pi = torch.empty_like(eta)
-        Zs = []
-        neg = (-torch.arange(K, device=eta.device)) % K
-        for i in range(4):
-            others = [j for j in range(4) if j != i]
-            S = self.circ_conv(self.circ_conv(eta[:, others[0]], eta[:, others[1]]),
-                               eta[:, others[2]])                        # (n,K): P(sum_{-i} = r)
-            un = eta[:, i] * S[:, neg]                                   # eta_{i,c} S(-c)
-            Z = un.sum(-1, keepdim=True)
-            pi[:, i] = un / Z
-            Zs.append(Z.squeeze(-1))
-        A = K * Zs[0]
-        return pi, A, torch.stack(Zs, 1)
+        """eta: (n,4,C) -> pi (n,4,C), A (n,), Zs (n,4). Delegated to the rule."""
+        return self.pools.rule.joint_posterior(eta)
 
     # ------------------------------------------------------------ targets
 
@@ -123,8 +112,11 @@ class ModKOracle:
         zf = z_tiles.reshape(n * 4, self.d)
         af = a.repeat_interleave(4)
         sf = s.repeat_interleave(4)
-        eta, mu, _ = self.tile_posteriors(zf, af, sf)
-        eta = eta.view(n, 4, self.K)
+        _, mu, logL = self.tile_posteriors(zf, af, sf)
+        # eta_i(c) = P(C_i = c | z_i) uses the rule's own per-slot marginal prior,
+        # which is uniform for mod-K but NOT for e.g. c0+c1 = c2+c3.
+        eta = torch.softmax(logL.view(n, 4, self.K)
+                            + self.pools.rule.log_marg.to(self.dtype)[None], dim=-1)
         mu = mu.view(n, 4, self.K, self.d)
         pi, A, Zs = self.joint_class_posterior(eta)
 

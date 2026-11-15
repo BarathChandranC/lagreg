@@ -53,12 +53,8 @@ def completions_batch(pools, K, z_tiles, eta, a, s, M):
     nb, _, d = z_tiles.shape
     dev = z_tiles.device
     ci = torch.multinomial(eta.reshape(nb * 4, K).float(), M, replacement=True).view(nb, 4, M)
-    cls = torch.randint(0, K, (nb, 4, M, 4), device=dev)              # [b, i, m, slot]
     ar = torch.arange(4, device=dev)
-    cls[:, ar, :, ar] = ci.permute(1, 0, 2)
-    last = (ar + 3) % 4
-    tot = cls.sum(-1) - cls[:, ar, :, last].permute(1, 0, 2)
-    cls[:, ar, :, last] = ((-tot) % K).permute(1, 0, 2)
+    cls = pools.rule.complete(ci)                                     # (nb,4,M,4)
     x = pools.tiles(pools.sample_idx(cls))                             # (nb,4,M,4,d)
     a_ = a.float().view(nb, 1, 1, 1, 1)
     s_ = s.float().view(nb, 1, 1, 1, 1)
